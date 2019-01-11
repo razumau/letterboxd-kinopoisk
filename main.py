@@ -1,13 +1,15 @@
 import csv
 import gzip
-
-from logzero import setup_logger
-import requests
 import os
-from datetime import datetime as dt
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime as dt
 from typing import Optional, List, DefaultDict
+
+import requests
+from bs4 import BeautifulSoup
+from logzero import setup_logger
 
 logger = setup_logger()
 
@@ -19,7 +21,7 @@ class TitleFinder:
     def __init__(self, data: DefaultDict):
         self._dict = data
 
-    def find_id(self, title: str, year: Optional[int] = None) -> str:
+    def find_id(self, title: str, year: Optional[int] = None) -> Optional[str]:
         films_with_title = self._dict.get(title)
         if not films_with_title:
             logger.info(f'No film with title "{title}"')
@@ -101,8 +103,61 @@ def download_imdb_titles_file():
     logger.info("IMDB data downloaded")
 
 
+def parse_kinopoisk_row(row) -> Optional[Film]:
+    try:
+        tds = row.findAll("td")
+        title = tds[1].getText()
+        if not title:
+            raise ValueError(f"No title found in {row}")
+
+        try:
+            year = int(tds[2].getText())
+        except TypeError as e:
+            logger.error(e)
+            logger.error(f"No year data for {title}")
+            year = None
+        except ValueError as e:
+            logger.error(e)
+            logger.error(f"Invalid year data for {title}")
+            year = None
+
+        try:
+            rating = int(tds[7].getText())
+        except (ValueError, TypeError):
+            logger.error(f"No rating data for {title}")
+            rating = None
+
+        date = dt.strptime(tds[-1].getText(), "%H:%M:%S %d.%m.%Y")
+        date_formatted = dt.strftime(date, "%Y-%m-%d")
+
+        return Film(title, year, rating, date_formatted)
+
+    except ValueError as e:
+        logger.error(e)
+        return None
+
+    except Exception as e:
+        logger.error(e)
+        logger.error(f"Parsing failed for {row}")
+        return None
+
+
 def load_kinopoisk_data(kinopoisk_filename: str) -> List[Film]:
     logger.info(f"Loading Kinopoisk data from {kinopoisk_filename}")
+    with open(kinopoisk_filename, encoding="cp1251") as file:
+        page = file.read()
+        soup = BeautifulSoup(page, "html.parser")
+        logger.info("Kinopoisk table loaded and parsed")
+        table = soup.find("table")
+        films_count = len(table.findAll("tr")) - 1
+        logger.info(f"{films_count} films in table")
+
+        films = (parse_kinopoisk_row(row) for row in table.findAll("tr")[1:])
+        parsed_films = [f for f in films if f]
+        logger.info(
+            f"{len(parsed_films)} out of {films_count} films parsed successfully"
+        )
+        return parsed_films
 
 
 def add_imdb_id(imdb: TitleFinder, film: Film) -> Film:
@@ -114,12 +169,26 @@ def add_imdb_id(imdb: TitleFinder, film: Film) -> Film:
 
 def export_to_csv(films_with_ids: List[Film]):
     logger.info("Exporting to CSV")
+    with open("letterbox.csv", "w") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(("imdbID", "Title", "Year", "WatchedDate", "Rating10"))
+        for film in films_with_ids:
+            writer.writerow(
+                (film.imdb_id, film.title, film.year, film.date, film.rating)
+            )
+    logger.info("Exported to CSV")
 
 
 if __name__ == "__main__":
+    if not sys.argv[1]:
+        logger.error("Please provide a kinopoisk file to parse")
+        sys.exit(1)
+
+    kinopoisk_filename = sys.argv[1]
+    films = load_kinopoisk_data(kinopoisk_filename)
+
     download_imdb_titles_file()
     imdb = build_title_finder()
 
-    films = load_kinopoisk_data(kinopoisk_filename)
     films_with_ids = [add_imdb_id(imdb, film) for film in films]
     export_to_csv(films_with_ids)
